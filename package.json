@@ -1,0 +1,21 @@
+{
+  "name": "three-quake",
+  "version": "1.0.0",
+  "description": "Quake level renderer using Three.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "three": "0.183.0"
+  },
+  "devDependencies": {
+    "vite": "^7.3.1",
+    "vite-plugin-cross-origin-storage": "^1.7.0"
+  }
+}
