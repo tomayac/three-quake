@@ -35,6 +35,7 @@ interface ClientConnection {
 	connected: boolean;
 	address: string;
 	lastMessageTime: number;
+	pendingWrites: number;
 }
 
 // Socket structure compatible with Quake's qsocket_t
@@ -86,33 +87,20 @@ const NET_MAXMESSAGE = 8192;
 // The game loop consumes messages at 20Hz — if hundreds pile up, something is wrong.
 const MAX_PENDING_MESSAGES = 100;
 
-// Helper: yield to the macrotask queue so setInterval (game loop) can run.
-//
-// reader.read() resolves via microtasks, which means multiple reader loops
-// can cascade without ever yielding to the macrotask queue. This starves the
-// game loop's setInterval callback.
-//
-// Strategy: yield AFTER successfully reading a message, not before. When no
-// data is available, reader.read() blocks naturally — no artificial delay.
-// This keeps latency minimal: messages are read immediately, then we yield.
-//
-// Backpressure: if the game loop isn't consuming messages fast enough
-// (pendingMessages piling up), yield longer to let it catch up.
-// When no backpressure, return a cached resolved promise to avoid allocation.
-const _resolvedPromise: Promise<void> = Promise.resolve();
-function _yieldAfterRead(conn: ClientConnection): Promise<void> {
-	const pending = conn.pendingMessages.length;
-	if (pending > 4) {
-		// Heavy backpressure: game loop is falling behind, back off significantly
-		return new Promise(resolve => setTimeout(resolve, 50));
-	}
-	if (pending > 1) {
-		// Light backpressure: game loop has unprocessed messages
-		return new Promise(resolve => setTimeout(resolve, 10));
-	}
-	// No backpressure: return immediately. reader.read() already blocks
-	// naturally when no data is available, which yields to the event loop.
-	return _resolvedPromise;
+// Write backpressure limits.
+// When writer.write() is called without await, each call queues a write promise.
+// If the client's network is slow/congested, these pile up unbounded, causing:
+// - Memory growth (each promise + Uint8Array frame stays alive until resolved)
+// - QUIC stack CPU spike (processing the massive write queue)
+// - Event loop starvation (same pattern as the datagram freeze from commit 82520e3)
+const MAX_PENDING_WRITES_UNRELIABLE = 32;  // Expendable — skip and send fresh data next tick
+const MAX_PENDING_WRITES_RELIABLE = 64;    // Critical — if this backed up, connection is dead
+
+// Yield to the macrotask queue so setInterval (game loop) can run.
+// reader.read() resolves via microtasks which can cascade without yielding.
+// setTimeout(resolve, 0) ensures the game loop's setInterval gets a chance to fire.
+function _yieldAfterRead(): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, 0));
 }
 
 // Callback for socket allocation (injected from game_server.js)
@@ -269,6 +257,27 @@ async function _handleWebTransportSession(wt: WebTransport, address: string): Pr
 	try {
 		await wt.ready;
 
+		// Register wt.closed handler early — before stream acceptance.
+		// If stream acceptance times out or fails, wt.closed can reject without
+		// a catch handler, causing unhandled rejection crashes in logs.
+		// We store the sock/conn references later once they exist.
+		let earlyDeath = false;
+		let deferredSock: QSocket | null = null;
+		let deferredConn: ClientConnection | null = null;
+		wt.closed.then(() => {
+			if (deferredSock !== null && deferredConn !== null) {
+				_handleConnectionDeath(deferredSock, deferredConn);
+			} else {
+				earlyDeath = true;
+			}
+		}).catch(() => {
+			if (deferredSock !== null && deferredConn !== null) {
+				_handleConnectionDeath(deferredSock, deferredConn);
+			} else {
+				earlyDeath = true;
+			}
+		});
+
 		const clientConn: ClientConnection = {
 			id: nextConnectionId++,
 			webTransport: wt,
@@ -282,6 +291,7 @@ async function _handleWebTransportSession(wt: WebTransport, address: string): Pr
 			connected: true,
 			address: address,
 			lastMessageTime: Date.now(),
+			pendingWrites: 0,
 		};
 
 		// Accept the first bidirectional stream (reliable channel)
@@ -327,13 +337,17 @@ async function _handleWebTransportSession(wt: WebTransport, address: string): Pr
 
 		pendingConnections.push(sock);
 
-		_startBackgroundReaders(sock, clientConn);
+		// Wire up deferred wt.closed handler (registered early, before stream acceptance)
+		deferredSock = sock;
+		deferredConn = clientConn;
 
-		wt.closed.then(() => {
+		// If the transport died during stream acceptance, handle it now
+		if (earlyDeath) {
 			_handleConnectionDeath(sock, clientConn);
-		}).catch(() => {
-			_handleConnectionDeath(sock, clientConn);
-		});
+			return;
+		}
+
+		_startBackgroundReaders(sock, clientConn);
 
 	} catch (error) {
 		Sys_Printf('Session error for %s: %s\n', address, (error as Error).message);
@@ -366,7 +380,7 @@ function _startBackgroundReaders(
 				}
 
 				// Yield to macrotask queue after reading so the game loop can run
-				await _yieldAfterRead(conn);
+				await _yieldAfterRead();
 			}
 		} catch (error) {
 			if (conn.connected) {
@@ -398,7 +412,7 @@ function _startBackgroundReaders(
 				}
 
 				// Yield to macrotask queue after reading so the game loop can run
-				await _yieldAfterRead(conn);
+				await _yieldAfterRead();
 			}
 		} catch (error) {
 			if (conn.connected) {
@@ -452,82 +466,46 @@ function _getReaderBuffer(reader: ReadableStreamDefaultReader<Uint8Array>): { da
 
 /**
  * Read exactly n bytes from a reader, with buffering for leftover bytes.
- * Optimized to avoid allocations in the common case where reader.read()
- * returns exactly the right number of bytes.
+ * Always copies data into a new Uint8Array to avoid holding references to
+ * QUIC stream internal buffers (which can cause buffer starvation and
+ * event loop freezes in Deno's QUIC stack).
  */
 async function _readExact(
 	reader: ReadableStreamDefaultReader<Uint8Array>,
 	n: number
 ): Promise<Uint8Array | null> {
 	const buf = _getReaderBuffer(reader);
-
-	// Fast path: no leftover buffer, read directly from stream
-	if (buf.data === null) {
-		const { value, done } = await reader.read();
-		if (done) return null;
-		if (value.length === 0) return null;
-
-		if (value.length === n) {
-			// Exact match — zero copy, no allocation
-			return value;
-		}
-
-		if (value.length > n) {
-			// More data than needed — return slice, save leftover
-			buf.data = value;
-			buf.offset = n;
-			return value.subarray(0, n);
-		}
-
-		// Less data than needed — fall through to accumulation path
-		const result = new Uint8Array(n);
-		result.set(value, 0);
-		let offset = value.length;
-
-		while (offset < n) {
-			const chunk = await reader.read();
-			if (chunk.done) return null;
-			if (chunk.value.length === 0) return null;
-
-			const bytesToCopy = Math.min(chunk.value.length, n - offset);
-			result.set(chunk.value.subarray(0, bytesToCopy), offset);
-			offset += bytesToCopy;
-
-			if (bytesToCopy < chunk.value.length) {
-				buf.data = chunk.value;
-				buf.offset = bytesToCopy;
-			}
-		}
-		return result;
-	}
-
-	// Slow path: leftover buffer exists, must accumulate
 	const result = new Uint8Array(n);
 	let offset = 0;
 
-	const available = buf.data.length - buf.offset;
-	const bytesToCopy = Math.min(available, n);
-	result.set(buf.data.subarray(buf.offset, buf.offset + bytesToCopy), 0);
-	offset = bytesToCopy;
-	buf.offset += bytesToCopy;
+	// Drain leftover bytes from previous read
+	if (buf.data !== null) {
+		const available = buf.data.length - buf.offset;
+		const bytesToCopy = Math.min(available, n);
+		result.set(buf.data.subarray(buf.offset, buf.offset + bytesToCopy), 0);
+		offset = bytesToCopy;
+		buf.offset += bytesToCopy;
 
-	if (buf.offset >= buf.data.length) {
-		buf.data = null;
-		buf.offset = 0;
+		if (buf.offset >= buf.data.length) {
+			buf.data = null;
+			buf.offset = 0;
+		}
 	}
 
+	// Read from stream until we have n bytes
 	while (offset < n) {
 		const { value, done } = await reader.read();
 		if (done) return null;
-		if (value.length === 0) return null;
+		if (value === undefined || value.length === 0) return null;
 
-		const chunkCopy = Math.min(value.length, n - offset);
-		result.set(value.subarray(0, chunkCopy), offset);
-		offset += chunkCopy;
+		const bytesToCopy = Math.min(value.length, n - offset);
+		result.set(value.subarray(0, bytesToCopy), offset);
+		offset += bytesToCopy;
 
-		if (chunkCopy < value.length) {
+		// Save leftover bytes for next call
+		if (bytesToCopy < value.length) {
 			buf.data = value;
-			buf.offset = chunkCopy;
+			buf.offset = bytesToCopy;
 		}
 	}
 
@@ -753,13 +731,24 @@ export function WT_QSendMessage(
 		return -1;
 	}
 
+	// Backpressure: if too many writes are in-flight, the connection is dead/zombie
+	if (conn.pendingWrites > MAX_PENDING_WRITES_RELIABLE) {
+		Sys_Printf('WT_QSendMessage: %d pending writes for %s, disconnecting\n', conn.pendingWrites, conn.address);
+		conn.connected = false;
+		return -1;
+	}
+
 	// Frame the message: [length:2][data:N]
 	const frame = new Uint8Array(2 + data.cursize);
 	frame[0] = data.cursize & 0xff;
 	frame[1] = (data.cursize >> 8) & 0xff;
 	frame.set(data.data.subarray(0, data.cursize), 2);
 
-	conn.reliableWriter.write(frame).catch((err) => {
+	conn.pendingWrites++;
+	conn.reliableWriter.write(frame).then(() => {
+		conn.pendingWrites--;
+	}).catch((err) => {
+		conn.pendingWrites--;
 		Sys_Printf('WT_QSendMessage: write FAILED: %s\n', (err as Error).message);
 		conn.connected = false;
 	});
@@ -777,13 +766,23 @@ export function WT_SendUnreliableMessage(
 	const conn = sock.driverdata;
 	if (!conn || !conn.connected || !conn.unreliableWriter) return -1;
 
+	// Backpressure: unreliable messages are expendable — skip if writes are backed up.
+	// Next tick will send fresh data anyway.
+	if (conn.pendingWrites > MAX_PENDING_WRITES_UNRELIABLE) {
+		return 1; // Pretend success — caller doesn't need to know we dropped it
+	}
+
 	// Frame the message: [length:2][data:N]
 	const frame = new Uint8Array(2 + data.cursize);
 	frame[0] = data.cursize & 0xff;
 	frame[1] = (data.cursize >> 8) & 0xff;
 	frame.set(data.data.subarray(0, data.cursize), 2);
 
-	conn.unreliableWriter.write(frame).catch(() => {
+	conn.pendingWrites++;
+	conn.unreliableWriter.write(frame).then(() => {
+		conn.pendingWrites--;
+	}).catch(() => {
+		conn.pendingWrites--;
 		// Unreliable — silently fail
 	});
 
@@ -862,6 +861,30 @@ export function WT_SetConfig(config: {
  */
 export function WT_SetDriverLevel(level: number): void {
 	net_driverlevel = level;
+}
+
+/**
+ * Get the maximum pendingWrites count across all active connections.
+ * Used for heartbeat diagnostics to detect write backpressure building up.
+ */
+export function WT_GetMaxPendingWrites(): number {
+	let max = 0;
+	let sock = activeSockets;
+	while (sock) {
+		const conn = sock.driverdata;
+		if (conn !== null && conn.pendingWrites > max) {
+			max = conn.pendingWrites;
+		}
+		sock = sock.next;
+	}
+	// Also check pending connections
+	for (let i = 0; i < pendingConnections.length; i++) {
+		const conn = pendingConnections[i].driverdata;
+		if (conn !== null && conn.pendingWrites > max) {
+			max = conn.pendingWrites;
+		}
+	}
+	return max;
 }
 
 /**
