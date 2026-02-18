@@ -3,6 +3,7 @@ import crossOriginStorage from 'vite-plugin-cross-origin-storage';
 
 export default defineConfig({
   assetsInclude: ['**/*.pak', '**/*.lmp'],
+  base: '/three-quake/',
   plugins: [
     crossOriginStorage({
       include: [/vendor-three-.*.js/],
