@@ -16,6 +16,7 @@ export class DataTexture {
 	constructor() {
 		this.needsUpdate = false;
 	}
+	dispose() {}
 }
 
 // Constants that might be referenced
@@ -29,6 +30,24 @@ export const SRGBColorSpace = 'srgb';
 export const FrontSide = 0;
 export const BackSide = 1;
 export const DoubleSide = 2;
+
+// Vector2 - used for renderer dimensions
+export class Vector2 {
+	constructor(x = 0, y = 0) {
+		this.x = x;
+		this.y = y;
+	}
+	set(x, y) {
+		this.x = x;
+		this.y = y;
+		return this;
+	}
+	floor() {
+		this.x = Math.floor(this.x);
+		this.y = Math.floor(this.y);
+		return this;
+	}
+}
 
 // Vector3 - might be used for math
 export class Vector3 {
@@ -158,6 +177,7 @@ export class BufferGeometry {
 		this.index = null;
 		this.boundingBox = null;
 		this.boundingSphere = null;
+		this.drawRange = { start: 0, count: Infinity };
 	}
 	setAttribute(name, attr) {
 		this.attributes[name] = attr;
@@ -169,6 +189,10 @@ export class BufferGeometry {
 	setIndex(index) {
 		this.index = index;
 		return this;
+	}
+	setDrawRange(start, count) {
+		this.drawRange.start = start;
+		this.drawRange.count = count;
 	}
 	computeBoundingBox() {}
 	computeBoundingSphere() {}
@@ -235,6 +259,13 @@ export class SpriteMaterial extends Material {
 	}
 }
 
+export class PointsMaterial extends Material {
+	constructor(params = {}) {
+		super();
+		Object.assign(this, params);
+	}
+}
+
 // Object3D stubs
 export class Object3D {
 	constructor() {
@@ -259,6 +290,24 @@ export class Object3D {
 	}
 	updateMatrix() {}
 	updateMatrixWorld() {}
+}
+
+export class PointLight extends Object3D {
+	constructor(color, intensity = 1, distance = 0, decay = 2) {
+		super();
+		this.color = color;
+		this.intensity = intensity;
+		this.distance = distance;
+		this.decay = decay;
+	}
+}
+
+export class Points extends Object3D {
+	constructor(geometry, material) {
+		super();
+		this.geometry = geometry;
+		this.material = material;
+	}
 }
 
 export class Mesh extends Object3D {
@@ -315,12 +364,4 @@ export class CanvasTexture extends Texture {
 	constructor() {
 		super();
 	}
-}
-
-// CSS3D stubs (imported by debug_overlay.js, not used on server)
-export class CSS3DRenderer {
-	constructor() {}
-}
-export class CSS3DObject {
-	constructor() {}
 }

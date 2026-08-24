@@ -13,6 +13,7 @@ import { Con_Printf, Con_DPrintf, SZ_Clear,
 	msg_readcount, msg_badread,
 	net_message, standard_quake } from './common.js';
 import { Sys_Error, Sys_FloatTime } from './sys.js';
+import { COM_FindFile, COM_EnsureFile } from './pak.js';
 import { Cbuf_AddText } from './cmd.js';
 import { Cmd_ExecuteString } from './cmd.js';
 import { src_command } from './cmd.js';
@@ -55,8 +56,9 @@ import {
 import { VectorCopy } from './mathlib.js';
 import { V_ParseDamage } from './view.js';
 import { Mod_ForName } from './gl_model.js';
-import { CL_SetServerState, CL_AcknowledgeCommand,
-	CL_FindAcknowledgedSequence, CL_SetValidSequence, CL_SetPlayerInfo,
+import { CL_SetServerState, CL_AcknowledgeCommand, CL_AcknowledgeTransportSequence,
+	CL_FindAcknowledgedSequence,
+	CL_SetValidSequence, CL_SetPlayerInfo,
 	CL_GetServerSequence, CL_SetServerSequence, CL_GetFrame, CL_GetEntityFrame,
 	CL_GetValidSequence } from './cl_pred.js';
 import { R_TranslatePlayerSkin } from './gl_rmisc.js';
@@ -327,6 +329,28 @@ export function CL_ParseServerInfo() {
 	//
 	// now we try to load everything else until a cache allocation fails
 	//
+
+	// Lazy-load: if the world BSP isn't cached yet, fetch it on demand and reconnect
+	if ( nummodels > 1 && COM_FindFile( model_precache[ 1 ] ) === null ) {
+
+		const addr = cls.netcon != null ? cls.netcon.address : null;
+		Con_Printf( 'Fetching %s...\n', model_precache[ 1 ] );
+		COM_EnsureFile( model_precache[ 1 ] ).then( ( success ) => {
+
+			if ( success && addr != null ) {
+
+				Cbuf_AddText( 'connect "' + addr + '"\n' );
+
+			} else {
+
+				Con_Printf( 'Couldn\'t fetch %s\n', model_precache[ 1 ] );
+
+			}
+
+		} );
+		return;
+
+	}
 
 	for ( i = 1; i < nummodels; i ++ ) {
 
@@ -1004,12 +1028,22 @@ export function CL_ParseClientdata( bits ) {
 	//
 	if ( cl.viewentity >= 1 && cl.viewentity < cl_entities.length ) {
 
-		// First, acknowledge commands based on timing
-		// This updates incoming_sequence to point to the correct frame
-		const ackSeq = CL_FindAcknowledgedSequence( realtime );
-		if ( ackSeq >= 0 ) {
+		// QuakeWorld-style reconciliation baseline:
+		// use the latest transport-level ack from server.
+		if ( cls.netcon != null ) {
 
-			CL_AcknowledgeCommand( ackSeq );
+			const ackSeq = cls.netcon.ackSequence | 0;
+			if ( ackSeq >= 0 ) {
+
+				CL_AcknowledgeTransportSequence( ackSeq );
+
+			} else {
+
+				const fallbackAckSeq = CL_FindAcknowledgedSequence( realtime );
+				if ( fallbackAckSeq >= 0 )
+					CL_AcknowledgeCommand( fallbackAckSeq );
+
+			}
 
 		}
 
@@ -1017,9 +1051,6 @@ export function CL_ParseClientdata( bits ) {
 		// This provides the base position/velocity for prediction replay
 		const ent = cl_entities[ cl.viewentity ];
 		CL_SetServerState( ent.msg_origins[ 0 ], cl.mvelocity[ 0 ], cl.onground );
-
-		// Mark that we have valid server data for prediction
-		CL_SetValidSequence( ackSeq >= 0 ? ackSeq : 1 );
 
 	}
 

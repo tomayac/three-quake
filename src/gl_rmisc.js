@@ -9,10 +9,10 @@ import { d_lightstylevalue, r_viewleaf, r_norefresh, r_lightmap,
 	gl_clear, gl_texsort, gl_cull, gl_smoothmodels, gl_affinemodels,
 	gl_polyblend, gl_flashblend, gl_playermip, gl_nocolors,
 	gl_keeptjunctions, gl_reporttjunctions, gl_doubleeyes, gl_texturemode,
-	gl_mtexable, skytexturenum, mirrortexturenum,
+	gl_mtexable, skytexturenum, mirrortexturenum, set_mirrortexturenum,
 	getTextureExtensionNumber, particletexture, playertextures,
 	envmap } from './glquake.js';
-import { r_worldentity, R_Init as R_Init_rmain, GL_BuildLightmaps as GL_BuildLightmaps_impl } from './gl_rmain.js';
+import { mod_alias, r_worldentity, R_Init as R_Init_rmain, R_NewMap as R_NewMap_rmain } from './gl_rmain.js';
 import { set_skytexturenum as set_skytexturenum_rsurf } from './gl_rsurf.js';
 import { cl, cl_entities } from './client.js';
 import { d_8to24table } from './vid.js';
@@ -22,8 +22,6 @@ let Cmd_AddCommand = null;
 let Cvar_RegisterVariable = null;
 let Cvar_SetValue = null;
 let R_InitParticles = null;
-let R_ClearParticles = null;
-let GL_BuildLightmaps = null;
 let R_RenderView = null;
 
 export function R_Misc_SetCallbacks( callbacks ) {
@@ -32,103 +30,7 @@ export function R_Misc_SetCallbacks( callbacks ) {
 	if ( callbacks.Cvar_RegisterVariable ) Cvar_RegisterVariable = callbacks.Cvar_RegisterVariable;
 	if ( callbacks.Cvar_SetValue ) Cvar_SetValue = callbacks.Cvar_SetValue;
 	if ( callbacks.R_InitParticles ) R_InitParticles = callbacks.R_InitParticles;
-	if ( callbacks.R_ClearParticles ) R_ClearParticles = callbacks.R_ClearParticles;
-	if ( callbacks.GL_BuildLightmaps ) GL_BuildLightmaps = callbacks.GL_BuildLightmaps;
 	if ( callbacks.R_RenderView ) R_RenderView = callbacks.R_RenderView;
-
-}
-
-/*
-==================
-R_InitTextures
-
-Creates r_notexture_mip - a simple checkerboard texture for the default
-==================
-*/
-export function R_InitTextures() {
-
-	// create a simple checkerboard texture for the default
-	const r_notexture_mip = {
-		name: 'notexture',
-		width: 16,
-		height: 16,
-		offsets: [ 0, 0, 0, 0 ],
-		data: null,
-		// Three.js texture
-		texture: null
-	};
-
-	// Generate mip levels: 16x16, 8x8, 4x4, 2x2
-	const totalSize = 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2;
-	const data = new Uint8Array( totalSize );
-
-	r_notexture_mip.offsets[ 0 ] = 0;
-	r_notexture_mip.offsets[ 1 ] = 16 * 16;
-	r_notexture_mip.offsets[ 2 ] = r_notexture_mip.offsets[ 1 ] + 8 * 8;
-	r_notexture_mip.offsets[ 3 ] = r_notexture_mip.offsets[ 2 ] + 4 * 4;
-
-	for ( let m = 0; m < 4; m ++ ) {
-
-		const size = 16 >> m;
-		const half = 8 >> m;
-		let offset = r_notexture_mip.offsets[ m ];
-
-		for ( let y = 0; y < size; y ++ ) {
-
-			for ( let x = 0; x < size; x ++ ) {
-
-				if ( ( y < half ) ^ ( x < half ) )
-					data[ offset ++ ] = 0;
-				else
-					data[ offset ++ ] = 0xff;
-
-			}
-
-		}
-
-	}
-
-	r_notexture_mip.data = data;
-
-	// Create Three.js checkerboard texture (pink/black)
-	const texData = new Uint8Array( 16 * 16 * 4 );
-	for ( let y = 0; y < 16; y ++ ) {
-
-		for ( let x = 0; x < 16; x ++ ) {
-
-			const idx = ( y * 16 + x ) * 4;
-			if ( ( y < 8 ) ^ ( x < 8 ) ) {
-
-				// Pink/magenta for missing texture
-				texData[ idx ] = 255;
-				texData[ idx + 1 ] = 0;
-				texData[ idx + 2 ] = 255;
-				texData[ idx + 3 ] = 255;
-
-			} else {
-
-				// Black
-				texData[ idx ] = 0;
-				texData[ idx + 1 ] = 0;
-				texData[ idx + 2 ] = 0;
-				texData[ idx + 3 ] = 255;
-
-			}
-
-		}
-
-	}
-
-	const texture = new THREE.DataTexture( texData, 16, 16, THREE.RGBAFormat );
-	texture.magFilter = THREE.NearestFilter;
-	texture.minFilter = THREE.NearestFilter;
-	texture.wrapS = THREE.RepeatWrapping;
-	texture.wrapT = THREE.RepeatWrapping;
-	texture.needsUpdate = true;
-
-	r_notexture_mip.texture = texture;
-
-	return r_notexture_mip;
 
 }
 
@@ -332,7 +234,7 @@ export function R_TranslatePlayerSkin( playernum ) {
 		return; // player doesn't have a model yet
 
 	const model = entity.model;
-	if ( model.type !== 'mod_alias' )
+	if ( model.type !== mod_alias )
 		return; // only translate skins on alias models
 
 	const paliashdr = model.cache != null ? model.cache.data : null;
@@ -405,13 +307,6 @@ export function R_NewMap( cl ) {
 	for ( let i = 0; i < 256; i ++ )
 		d_lightstylevalue[ i ] = 264; // normal light value
 
-	// Set up world entity
-	if ( r_worldentity ) {
-
-		r_worldentity.model = cl.worldmodel;
-
-	}
-
 	// clear out efrags in case the level hasn't been reloaded
 	if ( cl.worldmodel && cl.worldmodel.leafs ) {
 
@@ -420,11 +315,7 @@ export function R_NewMap( cl ) {
 
 	}
 
-	// r_viewleaf = null
-	if ( R_ClearParticles )
-		R_ClearParticles();
-
-	GL_BuildLightmaps_impl();
+	R_NewMap_rmain();
 
 	// identify sky texture
 	let skyTexNum = - 1;
@@ -447,6 +338,7 @@ export function R_NewMap( cl ) {
 
 	// Set sky texture number in gl_rsurf.js for DrawTextureChains
 	set_skytexturenum_rsurf( skyTexNum );
+	set_mirrortexturenum( mirrorTexNum );
 
 	return {
 		worldEntity: r_worldentity,

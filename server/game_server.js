@@ -5,7 +5,7 @@
 // Production: deno run --allow-net --allow-read --unstable-net --config /opt/three-quake/deno.json /opt/three-quake/server/game_server.js
 
 import { Sys_Printf, Sys_FloatTime } from '../src/sys.js';
-import { COM_FetchPak, COM_AddPack, COM_PreloadMaps } from '../src/pak.js';
+import { COM_FetchPak, COM_AddPack, COM_SetLooseFileBasePath, COM_EnsureFile } from '../src/pak.js';
 import { Cbuf_Init, Cbuf_Execute, Cmd_Init } from '../src/cmd.js';
 import { Host_InitCommands } from '../src/host_cmd.js';
 import { deathmatch, samelevel, noexit, sys_ticrate } from '../src/host.js';
@@ -16,7 +16,7 @@ import { SV_Init, SV_SpawnServer, SV_CheckForNewClients, SV_SendClientMessages, 
 import { SV_Physics, SV_SetFrametime } from '../src/sv_phys.js';
 import { SV_RunClients } from '../src/sv_user.js';
 import { svs, sv, client_t } from '../src/server.js';
-import { Mod_Init } from '../src/gl_model.js';
+import { Mod_Init, R_InitTextures } from '../src/gl_model.js';
 import { NET_Init, set_listening } from '../src/net_main.js';
 import { net_drivers, set_net_numdrivers, set_net_driverlevel } from '../src/net.js';
 
@@ -43,6 +43,9 @@ import {
 	WT_GetMaxPendingWrites,
 } from './net_webtransport_server.ts';
 import { NET_NewQSocket, NET_FreeQSocket } from '../src/net_main.js';
+
+// Reduce log write volume in production. Keep only allowlisted lines.
+globalThis.__THREE_QUAKE_QUIET_LOGS = true;
 
 // Global unhandled rejection handler - prevent server crashes from async errors
 globalThis.addEventListener('unhandledrejection', (event) => {
@@ -201,6 +204,7 @@ async function Host_Init_Server() {
 	// Initialize server systems
 	PR_Init();
 	Mod_Init();
+	R_InitTextures();
 	SV_Init();
 
 	// Set deathmatch mode - this ensures respawn() doesn't restart the entire server
@@ -229,18 +233,8 @@ async function Host_Init_Server() {
 	}
 	COM_AddPack(pak);
 
-	// Preload custom deathmatch maps (not in PAK files)
-	// Use absolute path for Deno server (maps are in /opt/three-quake/maps/)
-	await COM_PreloadMaps([
-		'spinev2',   // Headshot
-		'rapture1',  // Danimal
-		'naked5',    // Gandhi
-		'zed',       // Vondur
-		'efdm9',     // Mr Fribbles
-		'baldm6',    // Bal
-		'edc',       // Tyrann
-		'ultrav'     // Escher
-	], '/opt/three-quake/maps/');
+	// Set base path for on-demand loose file loading (custom maps not in PAK)
+	COM_SetLooseFileBasePath('/opt/three-quake/');
 
 	// Start listening for connections
 	await net_drivers[1].Listen(true);
@@ -249,6 +243,7 @@ async function Host_Init_Server() {
 	WT_SetMapCallbacks(
 		async (mapName) => {
 			Sys_Printf('Changing map to: ' + mapName + '\n');
+			await COM_EnsureFile('maps/' + mapName + '.bsp');
 			await SV_SpawnServer(mapName);
 		},
 		() => sv.name || ''
@@ -264,8 +259,9 @@ async function Host_Init_Server() {
 		svs.maxclients = maxClients;
 	});
 
-	// Spawn the default map
+	// Ensure the default map file is available, then spawn
 	Sys_Printf('Spawning server for map: ' + CONFIG.defaultMap + '\n');
+	await COM_EnsureFile('maps/' + CONFIG.defaultMap + '.bsp');
 	await SV_SpawnServer(CONFIG.defaultMap);
 
 	Sys_Printf('\nServer initialized!\n');

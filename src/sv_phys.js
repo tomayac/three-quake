@@ -170,7 +170,7 @@ export const sv_maxvelocity = new cvar_t( 'sv_maxvelocity', '2000' );
 export const sv_gravity = new cvar_t( 'sv_gravity', '800' );
 export const sv_nostep = new cvar_t( 'sv_nostep', '0' );
 export const sv_friction = new cvar_t( 'sv_friction', '4' );
-export const sv_edgefriction = new cvar_t( 'sv_edgefriction', '2' );
+export const sv_edgefriction = new cvar_t( 'edgefriction', '2' );
 export const sv_stopspeed = new cvar_t( 'sv_stopspeed', '100' );
 export const sv_maxspeed = new cvar_t( 'sv_maxspeed', '320' );
 export const sv_accelerate = new cvar_t( 'sv_accelerate', '10' );
@@ -572,11 +572,17 @@ export function SV_AddGravity( ent ) {
 
 	let ent_gravity;
 
-	const val = GetEdictFieldValue ? GetEdictFieldValue( ent, 'gravity' ) : null;
-	if ( val && val._float )
-		ent_gravity = val._float;
-	else
+	const val = GetEdictFieldValue != null ? GetEdictFieldValue( ent, 'gravity' ) : null;
+	if ( val != null ) {
+
+		const gravity = val.accessor.getFloat( val.ofs );
+		ent_gravity = gravity !== 0 ? gravity : 1.0;
+
+	} else {
+
 		ent_gravity = 1.0;
+
+	}
 
 	ent.v.velocity[ 2 ] -= ent_gravity * sv_gravity.value * host_frametime;
 

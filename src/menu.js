@@ -19,6 +19,7 @@ import { gl_texturemode, GL_UpdateTextureFiltering } from './glquake.js';
 import { skill, coop, teamplay, deathmatch, svs } from './server.js';
 import { Touch_ExitFullscreen } from './touch.js';
 import { Draw_GetVirtualWidth, Draw_GetVirtualHeight } from './gl_draw.js';
+import { SAVEGAME_COMMENT_LENGTH } from './quakedef.js';
 
 /*
 ==============================================================================
@@ -765,6 +766,7 @@ function M_SinglePlayer_Key( key ) {
 
 let load_cursor = 0;
 const MAX_SAVEGAMES = 12;
+const SAVE_STORAGE_PREFIX = 'quake_save_';
 
 const m_filenames = [];
 const loadable = [];
@@ -777,11 +779,43 @@ for ( let i = 0; i < MAX_SAVEGAMES; i ++ ) {
 
 function M_ScanSaves() {
 
-	// In browser, save games would be stored in localStorage or IndexedDB
 	for ( let i = 0; i < MAX_SAVEGAMES; i ++ ) {
 
 		m_filenames[ i ] = '--- UNUSED SLOT ---';
 		loadable[ i ] = false;
+
+	}
+	let storage;
+	try {
+
+		if ( typeof localStorage === 'undefined' ) return;
+		storage = localStorage;
+
+	} catch ( e ) {
+
+		return;
+
+	}
+
+	for ( let i = 0; i < MAX_SAVEGAMES; i ++ ) {
+
+		let saveData;
+		try {
+
+			saveData = storage.getItem( SAVE_STORAGE_PREFIX + 's' + i );
+
+		} catch ( e ) {
+
+			return;
+
+		}
+		if ( saveData === null ) continue;
+
+		const lines = saveData.split( '\n', 2 );
+		if ( lines.length < 2 ) continue;
+
+		m_filenames[ i ] = lines[ 1 ].substring( 0, SAVEGAME_COMMENT_LENGTH ).replace( /_/g, ' ' );
+		loadable[ i ] = true;
 
 	}
 
@@ -1125,22 +1159,11 @@ function M_LanConfig_Key( key ) {
 				const params = new URLSearchParams( window.location.search );
 				const serverUrl = params.get( 'server' ) || DEFAULT_WT_SERVER;
 
-				// Build connect URL - use room's port if available
-				let connectUrl;
-				if ( room.port ) {
-
-					// Connect directly to room server on its port
-					const urlObj = new URL( serverUrl.replace( /^wt(s)?:\/\//, 'https://' ) );
-					urlObj.port = String( room.port );
-					// Remove trailing slash - URL.toString() adds one which breaks wts:// URLs
-					connectUrl = urlObj.toString().replace( /\/$/, '' ).replace( /^https:\/\//, 'wts://' );
-
-				} else {
-
-					// Fallback: connect through lobby with room ID
-					connectUrl = serverUrl + '?room=' + encodeURIComponent( room.id );
-
-				}
+				// Always join through the lobby using room ID.
+				// This avoids connecting to stale room-port data from an old room list.
+				const urlObj = new URL( serverUrl.replace( /^wt(s)?:\/\//, 'https://' ) );
+				urlObj.searchParams.set( 'room', room.id );
+				const connectUrl = urlObj.toString().replace( /\/$/, '' ).replace( /^https:\/\//, 'wts://' );
 
 				// Update browser URL so user can share it
 				const shareUrl = window.location.origin + window.location.pathname + '?room=' + room.id;
@@ -1377,9 +1400,16 @@ function M_GameOptions_Key( key ) {
 						hostName: _cl_name ? _cl_name.string : 'Player'
 					} ).then( ( room ) => {
 
-						if ( room && room.id ) {
+						if ( room != null && typeof room.id === 'string' && room.id.length > 0 ) {
 
-							Con_Printf( 'Room created: ' + room.id + ( room.port ? ' on port ' + room.port : '' ) + '\n' );
+							let roomInfo = room.id;
+							if ( room.port != null ) {
+
+								roomInfo += ' on port ' + room.port;
+
+							}
+
+							Con_Printf( 'Room created: ' + roomInfo + '\n' );
 							// Update browser URL so user can share it
 							const shareUrl = window.location.origin + window.location.pathname + '?room=' + room.id;
 							history.replaceState( null, '', shareUrl );
@@ -1391,7 +1421,7 @@ function M_GameOptions_Key( key ) {
 							// Connect to the remote server as a client (not local game)
 							// The remote server is the authoritative game server
 							let connectUrl;
-							if ( room.port ) {
+							if ( room.port != null ) {
 
 								// Connect directly to room server on its port
 								const urlObj = new URL( serverUrl.replace( /^wt(s)?:\/\//, 'https://' ) );
@@ -1407,8 +1437,12 @@ function M_GameOptions_Key( key ) {
 							}
 
 							Cbuf_AddText( 'connect "' + connectUrl + '"\n' );
+							return;
 
 						}
+
+						Con_Printf( 'Failed to create room: Invalid room response from server\n' );
+						if ( _SCR_EndLoadingPlaque ) _SCR_EndLoadingPlaque();
 
 					} ).catch( ( e ) => {
 
@@ -1850,7 +1884,7 @@ function M_Keys_Key( key ) {
 		} else {
 
 			// Set the binding via Cbuf
-			Cbuf_AddText( 'bind "' + key + '" "' + bindnames[ m_keys_cursor ][ 0 ] + '"\n' );
+			Cbuf_AddText( 'bind "' + Key_KeynumToString( key ) + '" "' + bindnames[ m_keys_cursor ][ 0 ] + '"\n' );
 
 		}
 
@@ -2068,6 +2102,15 @@ function M_Setup_Key( key ) {
 ==============================================================================
 */
 
+const CREDITS_SOURCE_URL = 'https://github.com/mrdoob/three-quake';
+
+function M_OpenCreditsSource() {
+
+	if ( typeof window !== 'undefined' )
+		window.open( CREDITS_SOURCE_URL, '_blank' );
+
+}
+
 function M_Menu_Credits_f() {
 
 	setKeyDest( key_menu );
@@ -2093,7 +2136,9 @@ function M_Credits_Draw() {
 	M_PrintWhite( 16, 124, 'Support            Id Mom\n' );
 	M_Print( 16, 132, ' Barrett Alexander  Shawn Green\n' );
 	M_PrintWhite( 16, 148, 'JavaScript port\n' );
-	M_Print( 16, 156, ' mrdoob + claude opus\n' );
+	M_Print( 16, 156, ' mrdoob + claude + codex\n' );
+	M_PrintWhite( 16, 172, 'Source code\n' );
+	M_Print( 16, 180, ' github.com/mrdoob/three-quake\n' );
 
 }
 
@@ -2104,12 +2149,22 @@ function M_Credits_Key( key ) {
 		case K_ESCAPE:
 			M_Menu_Main_f();
 			break;
+		case K_ENTER:
+			M_OpenCreditsSource();
+			break;
 
 	}
 
 }
 
 function M_Credits_Touch( vx, vy ) {
+
+	if ( vy >= 172 ) {
+
+		M_OpenCreditsSource();
+		return;
+
+	}
 
 	M_Credits_Key( K_ESCAPE );
 

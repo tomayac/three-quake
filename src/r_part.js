@@ -58,7 +58,7 @@ let freeList = - 1; // head index of free list
 
 // External state
 let _scene = null;
-let _sv_gravity = 800; // default gravity
+let _sv_gravity = { value: 800 }; // cvar-like default; canonical cvar injected by Host_Init
 
 // THREE.js rendering objects
 let pointsGeometry = null;
@@ -145,7 +145,7 @@ R_SetParticleExternals
 export function R_SetParticleExternals( externals ) {
 
 	if ( externals.scene ) _scene = externals.scene;
-	if ( externals.sv_gravity !== undefined ) _sv_gravity = externals.sv_gravity;
+	if ( externals.sv_gravity != null ) _sv_gravity = externals.sv_gravity;
 
 }
 
@@ -638,10 +638,10 @@ export function R_DrawParticles() {
 
 	if ( ! client_cl || ! _scene ) return;
 
-	// Use absolute frametime, not cl.time - cl.oldtime
-	// cl.time can be modified by CL_LerpPoint which causes frametime to go <= 0
+	// cl.time can be modified by CL_LerpPoint, but an exact zero delta means
+	// the client is paused and particle physics must remain frozen.
 	let frametime = client_cl.time - client_cl.oldtime;
-	if ( frametime <= 0 || frametime > 0.5 ) {
+	if ( frametime < 0 || frametime > 0.5 ) {
 
 		// Fallback to a reasonable frametime for particle physics
 		// but still process dead particle removal
@@ -652,7 +652,7 @@ export function R_DrawParticles() {
 	const time3 = frametime * 15;
 	const time2 = frametime * 10;
 	const time1 = frametime * 5;
-	const grav = frametime * _sv_gravity * 0.05;
+	const grav = frametime * _sv_gravity.value * 0.05;
 	const dvel = 4 * frametime;
 
 	// Remove dead particles from front of active list

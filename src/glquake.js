@@ -188,6 +188,8 @@ export let r_entorigin = new Float32Array( 3 );
 export let currententity = null;
 export let r_visframecount = 0;
 export let r_framecount = 0;
+export function set_r_framecount( value ) { r_framecount = value; }
+export function inc_r_framecount() { return ++ r_framecount; }
 export let frustum = []; // mplane_t[4]
 export let c_brush_polys = 0;
 export let c_alias_polys = 0;
@@ -209,6 +211,7 @@ export let envmap = false;
 
 export let skytexturenum = - 1;
 export let mirrortexturenum = - 1;
+export function set_mirrortexturenum( value ) { mirrortexturenum = value; }
 export let mirror = false;
 export let mirror_plane = null;
 
@@ -253,10 +256,10 @@ export const gl_keeptjunctions = { name: 'gl_keeptjunctions', string: '0', value
 export const gl_reporttjunctions = { name: 'gl_reporttjunctions', string: '0', value: 0 };
 export const gl_flashblend = { name: 'gl_flashblend', string: '1', value: 1 };
 export const gl_nocolors = { name: 'gl_nocolors', string: '0', value: 0 };
-export const gl_doubleeyes = { name: 'gl_doubleeyes', string: '1', value: 1 };
+export const gl_doubleeyes = { name: 'gl_doubleeys', string: '1', value: 1 };
 export const gl_max_size = { name: 'gl_max_size', string: '1024', value: 1024 };
 export const gl_playermip = { name: 'gl_playermip', string: '0', value: 0 };
-export const gl_subdivide_size = { name: 'gl_subdivide_size', string: '128', value: 128 };
+export const gl_subdivide_size = { name: 'gl_subdivide_size', string: '128', value: 128, archive: true };
 // Texture filtering: 0 = nearest (pixelated), 1 = linear (smooth)
 export const gl_texturemode = { name: 'gl_texturemode', string: '0', value: 0, archive: true };
 
@@ -265,11 +268,19 @@ export const _allGameTextures = [];
 
 export function GL_RegisterTexture( texture ) {
 
-	if ( texture && ! _allGameTextures.includes( texture ) ) {
+	if ( texture != null && _allGameTextures.includes( texture ) === false ) {
 
 		_allGameTextures.push( texture );
 
 	}
+
+}
+
+export function GL_UnregisterTexture( texture ) {
+
+	if ( texture == null ) return;
+	const index = _allGameTextures.indexOf( texture );
+	if ( index !== - 1 ) _allGameTextures.splice( index, 1 );
 
 }
 

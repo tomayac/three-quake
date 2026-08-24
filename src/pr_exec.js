@@ -34,6 +34,7 @@ import {
 	OP_BITAND, OP_BITOR,
 } from './pr_comp.js';
 import { ED_Print } from './pr_edict.js';
+import { ss_active } from './server.js';
 
 /*
 */
@@ -49,6 +50,26 @@ let pr_depth = 0;
 
 const localstack = new Int32Array( LOCALSTACK_SIZE );
 let localstack_used = 0;
+
+let Host_Error = null;
+
+export function PR_SetHostError( callback ) {
+
+	const previous = Host_Error;
+	Host_Error = callback;
+	return previous;
+
+}
+
+export function PR_HostError( error ) {
+
+	if ( Host_Error === null )
+		Sys_Error( 'PR_HostError: Host_Error callback not set' );
+
+	Host_Error( error );
+	Sys_Error( 'PR_HostError: Host_Error returned' );
+
+}
 
 const pr_opnames = [
 	'DONE',
@@ -231,8 +252,7 @@ export function PR_RunError( error, ...args ) {
 
 	pr_depth = 0; // dump the stack so host_error can shutdown functions
 
-	// Host_Error("Program error");
-	throw new Error( 'Program error: ' + message );
+	PR_HostError( 'Program error' );
 
 }
 
@@ -329,7 +349,7 @@ export function PR_ExecuteProgram( fnum ) {
 
 		if ( pr_global_struct.self !== 0 )
 			ED_Print( PROG_TO_EDICT( pr_global_struct.self ) );
-		throw new Error( 'PR_ExecuteProgram: NULL function' );
+		PR_HostError( 'PR_ExecuteProgram: NULL function' );
 
 	}
 
@@ -538,6 +558,8 @@ export function PR_ExecuteProgram( fnum ) {
 			case OP_ADDRESS: {
 
 				const ed = PROG_TO_EDICT( gi[ stA ] );
+				if ( ed === sv.edicts[ 0 ] && sv.state === ss_active )
+					PR_RunError( 'assignment to world entity' );
 				// Encode edict index and field offset into a single int
 				// b->_int is the field offset within the edict
 				gi[ stC ] = ( ed.index << 16 ) | ( gi[ stB ] & 0xFFFF );

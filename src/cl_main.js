@@ -11,12 +11,12 @@ import { cvar_t, Cvar_RegisterVariable, Cvar_VariableValue } from './cvar.js';
 import { Cmd_AddCommand } from './cmd.js';
 import { Cbuf_InsertText } from './cmd.js';
 import { clc_disconnect, clc_stringcmd } from './protocol.js';
-import { CL_GetMessage, CL_PlayDemo_f, CL_StopPlayback, CL_Stop_f } from './cl_demo.js';
+import { CL_GetMessage, CL_Record_f, CL_PlayDemo_f, CL_TimeDemo_f, CL_StopPlayback, CL_Stop_f } from './cl_demo.js';
 import { CL_ParseServerMessage } from './cl_parse.js';
 import { SIGNONS, MAX_DLIGHTS, MAX_EFRAGS, MAX_BEAMS, MAX_TEMP_ENTITIES,
-	MAX_STATIC_ENTITIES, MAX_DEMOS, MAX_VISEDICTS,
+	MAX_DEMOS, MAX_VISEDICTS,
 	ca_dedicated, ca_disconnected, ca_connected,
-	cl, cls, cl_efrags, cl_entities, cl_static_entities,
+	cl, cls, cl_efrags, cl_entities,
 	cl_lightstyle, cl_dlights, cl_temp_entities, cl_beams,
 	cl_numvisedicts, cl_visedicts, set_cl_numvisedicts,
 	dlight_t, entity_t, efrag_t, lightstyle_t, beam_t,
@@ -25,7 +25,7 @@ import { SIGNONS, MAX_DLIGHTS, MAX_EFRAGS, MAX_BEAMS, MAX_TEMP_ENTITIES,
 import { anglemod, VectorCopy, VectorMA, AngleVectors } from './mathlib.js';
 import { R_RocketTrail, R_RemoveEfrags, R_EntityParticles } from './render.js';
 import { CL_InitTEnts, CL_UpdateTEnts } from './cl_tent.js';
-import { host_frametime, realtime, Host_Error, Host_ShutdownServer, sv } from './host.js';
+import { host_frametime, realtime, Host_Error, Host_ShutdownServer, Host_ClearMemory, sv } from './host.js';
 import { SCR_EndLoadingPlaque, SCR_BeginLoadingPlaque } from './gl_screen.js';
 import { S_StopAllSounds } from './snd_dma.js';
 import { M_ConnectionError, M_ShouldReturnOnError } from './menu.js';
@@ -65,8 +65,8 @@ CL_ClearState
 */
 export function CL_ClearState() {
 
-	// if (!sv.active)
-	//     Host_ClearMemory();
+	if ( sv.active === false )
+		Host_ClearMemory();
 
 	// Reset client-side prediction state
 	CL_ResetPrediction();
@@ -957,16 +957,6 @@ export function CL_RelinkEntities() {
 
 	set_cl_numvisedicts( 0 );
 
-	// Add static entities (torches, flames, etc.) to visedicts.
-	// Bypasses the unimplemented efrag system — safe because r_novis=1.
-	for ( let i = 0; i < cl.num_statics; i ++ ) {
-		if ( cl_numvisedicts >= MAX_VISEDICTS ) break;
-		const ent = cl_static_entities[ i ];
-		if ( ent.model == null ) continue;
-		cl_visedicts[ cl_numvisedicts ] = ent;
-		set_cl_numvisedicts( cl_numvisedicts + 1 );
-	}
-
 	//
 	// interpolate player info
 	//
@@ -1303,10 +1293,10 @@ export function CL_Init() {
 
 	Cmd_AddCommand( 'entities', CL_PrintEntities_f );
 	Cmd_AddCommand( 'disconnect', CL_Disconnect_f );
-	// Cmd_AddCommand( 'record', CL_Record_f );
-	// Cmd_AddCommand( 'stop', CL_Stop_f );
+	Cmd_AddCommand( 'record', CL_Record_f );
+	Cmd_AddCommand( 'stop', CL_Stop_f );
 	Cmd_AddCommand( 'playdemo', CL_PlayDemo_f );
-	// Cmd_AddCommand( 'timedemo', CL_TimeDemo_f );
+	Cmd_AddCommand( 'timedemo', CL_TimeDemo_f );
 
 }
 

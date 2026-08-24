@@ -17,18 +17,19 @@ import { Mod_PointInLeaf, SPR_SINGLE, SPR_ORIENTED } from './gl_model.js';
 import { R_AnimateLight as R_AnimateLight_impl, R_PushDlights as R_PushDlights_impl, R_RenderDlights as R_RenderDlights_impl, R_LightPoint, lightspot } from './gl_rlight.js';
 import { R_DrawAliasModel as R_DrawAliasModel_mesh, GL_DrawAliasShadow } from './gl_mesh.js';
 import { r_avertexnormal_dots } from './anorm_dots.js';
-import { V_SetContentsColor as V_SetContentsColor_view, V_CalcBlend as V_CalcBlend_view, v_blend as v_blend_view } from './view.js';
+import { V_SetContentsColor as V_SetContentsColor_view, V_CalcBlend as V_CalcBlend_view } from './view.js';
+import { chase_active } from './chase.js';
 import {
 	R_InitParticles, R_SetParticleExternals, R_ClearParticles,
 	R_DrawParticles as R_DrawParticles_impl
 } from './r_part.js';
-import { Debug_UpdateOverlay, Debug_ClearLabels } from './debug_overlay.js';
 import { isXRActive, getXRRig, XR_SetCamera, XR_SCALE, XR_GetControllerWorldPose } from './webxr.js';
 import {
 	cl, cl_visedicts, cl_numvisedicts, cl_dlights, cl_entities,
-	cl_lightstyle
+	cl_static_entities, cl_temp_entities, cl_lightstyle
 } from './client.js';
-import { d_lightstylevalue,
+import { d_lightstylevalue, r_framecount, set_r_framecount, inc_r_framecount,
+	v_blend, mirrortexturenum, set_mirrortexturenum,
 	r_norefresh, r_drawentities, r_drawviewmodel, r_speeds,
 	r_fullbright, r_lightmap, r_shadows, r_mirroralpha,
 	r_wateralpha, r_dynamic, r_novis, r_drawworld, r_waterwarp,
@@ -39,6 +40,7 @@ import { d_lightstylevalue,
 } from './glquake.js';
 export { GL_BuildLightmaps_rsurf as GL_BuildLightmaps };
 export { r_norefresh, r_drawentities, r_drawviewmodel, r_speeds,
+	v_blend, mirrortexturenum, set_mirrortexturenum,
 	r_fullbright, r_lightmap, r_shadows, r_mirroralpha,
 	r_wateralpha, r_dynamic, r_novis, r_drawworld, r_waterwarp,
 	gl_clear, gl_cull, gl_texsort, gl_smoothmodels, gl_affinemodels,
@@ -103,7 +105,6 @@ export const r_entorigin = new Float32Array( 3 );
 export let currententity = null; // entity_t pointer
 
 export let r_visframecount = 0; // bumped when going to a new PVS
-export let r_framecount = 0; // used for dlight push checking
 
 // frustum planes (4 planes for view frustum)
 export class mplane_t {
@@ -134,7 +135,6 @@ export const cnttextures = [ - 1, - 1 ]; // cached
 export let particletexture = 0; // little dot for particles
 export let playertextures = 0; // up to 16 color translated skins
 
-export let mirrortexturenum = 0; // quake texturenum, not gltexturenum
 export let mirror = false;
 export let mirror_plane = null; // mplane_t pointer
 
@@ -146,9 +146,10 @@ export let r_oldviewleaf = null; // mleaf_t
 
 export let r_notexture_mip = null;
 
-// d_lightstylevalue is imported from glquake.js and re-exported here
-// so gl_rsurf.js can import it (avoids circular dep with gl_rlight.js)
-export { d_lightstylevalue };
+// Shared renderer state is imported from glquake.js and re-exported here so
+// gl_rsurf.js keeps its existing dependency without adding a gl_rlight cycle.
+export { d_lightstylevalue, r_framecount, set_r_framecount, inc_r_framecount };
+export { chase_active };
 
 export let gldepthmin = 0;
 export let gldepthmax = 1;
@@ -156,8 +157,8 @@ export let gldepthmax = 1;
 // Setter functions for mutable state (ES module imports are read-only)
 export function set_r_visframecount( v ) { r_visframecount = v; }
 export function inc_r_visframecount() { return ++ r_visframecount; }
-export function set_r_framecount( v ) { r_framecount = v; }
-export function inc_r_framecount() { return ++ r_framecount; }
+export function set_r_worldentity( value ) { r_worldentity = value; }
+export function set_currententity( value ) { currententity = value; }
 export function set_c_brush_polys( v ) { c_brush_polys = v; }
 export function inc_c_brush_polys() { return ++ c_brush_polys; }
 export function set_currenttexture( v ) { currenttexture = v; }
@@ -183,14 +184,6 @@ export let camera = null; // THREE.PerspectiveCamera
 // They are registered in gl_rmisc.js R_Init().
 // gl_ztrick is unique to gl_rmain (not in glquake.js).
 export const gl_ztrick = new cvar_t( 'gl_ztrick', '1' );
-
-//============================================================================
-// v_blend -- screen blend color for damage/powerups
-//============================================================================
-
-export const v_blend = new Float32Array( 4 ); // r, g, b, a
-
-export const chase_active = new cvar_t( 'chase_active', '0' );
 
 //============================================================================
 // R_CullBox
@@ -284,7 +277,7 @@ export function R_SetupFrame() {
 
 	R_AnimateLight();
 
-	r_framecount ++;
+	inc_r_framecount();
 
 	// build the transformation matrix for the given view angles
 	VectorCopy( r_refdef.vieworg, r_origin );
@@ -471,6 +464,37 @@ export function R_SetupGL() {
 	for ( let i = 0; i < 16; i ++ ) {
 
 		r_world_matrix[ i ] = elements[ i ];
+
+	}
+
+	// The view rectangle uses virtual 2D coordinates with a top-left origin.
+	// Recreate Quake's physical-pixel viewport, then convert back to the logical
+	// coordinates Three.js expects before it reapplies the renderer pixel ratio.
+	if ( isXRActive() === false && renderer !== null ) {
+
+		renderer.getDrawingBufferSize( _setupgl_drawingBufferSize );
+		const bufferWidth = _setupgl_drawingBufferSize.x;
+		const bufferHeight = _setupgl_drawingBufferSize.y;
+		const scale = r_refdef.vrectScale;
+		let x = r_refdef.vrect.x * scale;
+		let x2 = ( r_refdef.vrect.x + r_refdef.vrect.width ) * scale;
+		let y = bufferHeight - r_refdef.vrect.y * scale;
+		let y2 = bufferHeight -
+			( r_refdef.vrect.y + r_refdef.vrect.height ) * scale;
+
+		// Match GLQuake's one-pixel expansion around fractional view boundaries.
+		if ( x > 0 ) x --;
+		if ( x2 < bufferWidth ) x2 ++;
+		if ( y2 < 0 ) y2 --;
+		if ( y < bufferHeight ) y ++;
+
+		const pixelRatio = renderer.getPixelRatio();
+		renderer.setViewport(
+			x / pixelRatio,
+			y2 / pixelRatio,
+			( x2 - x ) / pixelRatio,
+			( y - y2 ) / pixelRatio
+		);
 
 	}
 
@@ -706,6 +730,73 @@ export function R_DrawViewModel() {
 // Track entity meshes currently in the scene for efficient add/remove
 let _entityMeshesInScene = new Set();
 let _entityMeshesThisFrame = new Set();
+const _entityMeshCacheOwners = new Set();
+
+function _disposeEntityGeometry( geometry, geometries ) {
+
+	if ( geometry == null || geometries.has( geometry ) ) return;
+	geometries.add( geometry );
+	geometry.dispose();
+
+}
+
+function _disposeEntityMaterial( material, materials ) {
+
+	if ( material == null || materials.has( material ) ) return;
+	materials.add( material );
+	material.dispose();
+
+}
+
+function _detachEntityMesh( mesh ) {
+
+	if ( mesh == null ) return;
+	if ( mesh.parent != null ) mesh.parent.remove( mesh );
+	mesh._quakeOwner = null;
+
+}
+
+function _clearEntityMeshCache( entity, geometries, materials ) {
+
+	if ( entity == null ) return;
+
+	const spriteMesh = entity._spriteMesh;
+	const aliasMesh = entity._aliasMesh;
+	const shadowMesh = entity._aliasShadowMesh;
+	const aliasGeometry = entity._aliasGeo;
+	const shadowGeometry = entity._aliasShadowGeo;
+	const viewmodelMaterial = entity._viewmodelMaterial;
+	const playerMaterial = entity._playerMaterial;
+	if ( spriteMesh == null && aliasMesh == null && shadowMesh == null &&
+		aliasGeometry == null && shadowGeometry == null &&
+		viewmodelMaterial == null && playerMaterial == null ) return;
+
+	_detachEntityMesh( spriteMesh );
+	_detachEntityMesh( aliasMesh );
+	_detachEntityMesh( shadowMesh );
+
+	_disposeEntityGeometry( spriteMesh != null ? spriteMesh.geometry : null, geometries );
+	_disposeEntityGeometry( aliasGeometry, geometries );
+	_disposeEntityGeometry( shadowGeometry, geometries );
+	_disposeEntityMaterial( viewmodelMaterial, materials );
+	_disposeEntityMaterial( playerMaterial, materials );
+
+	entity._spriteMesh = null;
+	entity._aliasMesh = null;
+	entity._aliasGeo = null;
+	entity._aliasColorArray = null;
+	entity._aliasPaliashdr = null;
+	entity._aliasPosenum = undefined;
+	entity._aliasShadowMesh = null;
+	entity._aliasShadowGeo = null;
+	entity._aliasShadowPosArray = null;
+	entity._aliasShadowVertCount = undefined;
+	entity._viewmodelMaterial = null;
+	entity._viewmodelMaterialBase = null;
+	entity._playerMaterial = null;
+	entity._playerSkinTexture = null;
+
+}
 
 // Pre-allocated vector for dynamic light distance calculation (avoid per-frame allocation)
 const _dlightDist = [ 0, 0, 0 ];
@@ -716,6 +807,7 @@ const _setupgl_forward = new Float32Array( 3 );
 const _setupgl_right = new Float32Array( 3 );
 const _setupgl_up = new Float32Array( 3 );
 const _setupgl_matrix = new THREE.Matrix4();
+const _setupgl_drawingBufferSize = new THREE.Vector2();
 
 function R_DrawAliasModel( e ) {
 
@@ -804,6 +896,12 @@ function R_DrawAliasModel( e ) {
 	}
 
 	const mesh = R_DrawAliasModel_mesh( e, paliashdr, shadedots, shadelight );
+	if ( mesh != null ) {
+
+		mesh._quakeOwner = e;
+		_entityMeshCacheOwners.add( e );
+
+	}
 	if ( mesh && scene ) {
 
 		if ( ! _entityMeshesInScene.has( mesh ) ) {
@@ -822,6 +920,9 @@ function R_DrawAliasModel( e ) {
 
 		const shadowMesh = GL_DrawAliasShadow( e, paliashdr, e._aliasPosenum || 0, lightspot, _shadevector );
 		if ( shadowMesh != null ) {
+
+			shadowMesh._quakeOwner = e;
+			_entityMeshCacheOwners.add( e );
 
 			if ( ! _entityMeshesInScene.has( shadowMesh ) ) {
 
@@ -976,6 +1077,8 @@ function R_DrawSpriteModel( e ) {
 		if ( mesh.material !== material ) mesh.material = material;
 
 	}
+	mesh._quakeOwner = e;
+	_entityMeshCacheOwners.add( e );
 
 	// Update billboard vertex positions every frame
 	posAttr = mesh.geometry.attributes.position;
@@ -1129,8 +1232,6 @@ export function R_RenderScene() {
 
 	R_DrawParticles();
 
-	Debug_UpdateOverlay();
-
 }
 
 //============================================================================
@@ -1261,30 +1362,69 @@ export function R_NewMap() {
 	// clear old data
 	r_viewleaf = null;
 	r_oldviewleaf = null;
+	const resetWorldEntity = new entity_t();
+	if ( r_worldentity == null ) {
+
+		r_worldentity = resetWorldEntity;
+
+	} else {
+
+		// WinQuake memsets one static entity, so preserve its published identity.
+		for ( const key of Object.keys( r_worldentity ) )
+			delete r_worldentity[ key ];
+		Object.assign( r_worldentity, resetWorldEntity );
+
+	}
+	r_worldentity.model = cl != null ? cl.worldmodel : null;
 
 	// reset framecount
-	r_framecount = 1;
+	set_r_framecount( 1 );
 	r_visframecount = 0;
 
-	// initialize light style values
-	for ( let i = 0; i < 256; i ++ ) {
+	R_ClearParticles();
 
-		d_lightstylevalue[ i ] = 264;
+	// Clean up all cached entity resources from the previous map. Static
+	// entities keep their JS identity across CL_ClearState, so invalidate the
+	// owner-side caches as well as the scene tracking sets.
+	const geometries = new Set();
+	const materials = new Set();
+	for ( const owner of _entityMeshCacheOwners )
+		_clearEntityMeshCache( owner, geometries, materials );
+	_entityMeshCacheOwners.clear();
 
-	}
+	for ( let i = 0; i < cl_entities.length; i ++ )
+		_clearEntityMeshCache( cl_entities[ i ], geometries, materials );
+	for ( let i = 0; i < cl_static_entities.length; i ++ )
+		_clearEntityMeshCache( cl_static_entities[ i ], geometries, materials );
+	for ( let i = 0; i < cl_temp_entities.length; i ++ )
+		_clearEntityMeshCache( cl_temp_entities[ i ], geometries, materials );
+	if ( cl != null ) _clearEntityMeshCache( cl.viewent, geometries, materials );
 
-	// Clean up all cached entity meshes from the previous map
 	for ( const mesh of _entityMeshesInScene ) {
 
-		if ( scene ) scene.remove( mesh );
+		if ( mesh.parent != null ) mesh.parent.remove( mesh );
+		if ( mesh.geometry != null && geometries.has( mesh.geometry ) === false ) {
+
+			geometries.add( mesh.geometry );
+			mesh.geometry.dispose();
+
+		}
 
 	}
 
-	_entityMeshesInScene = new Set();
+	_entityMeshesInScene.clear();
 	_entityMeshesThisFrame.clear();
-	_spriteMaterialCache.clear();
+	for ( const material of _spriteMaterialCache.values() ) {
 
-	Debug_ClearLabels();
+		if ( materials.has( material ) === false ) {
+
+			materials.add( material );
+			material.dispose();
+
+		}
+
+	}
+	_spriteMaterialCache.clear();
 
 	// rebuild lightmaps
 	GL_BuildLightmaps_rsurf();
@@ -1313,11 +1453,6 @@ function V_SetContentsColor( contents ) {
 function V_CalcBlend() {
 
 	V_CalcBlend_view();
-	// Copy view.js's v_blend into gl_rmain.js's v_blend so R_PolyBlend can read it
-	v_blend[ 0 ] = v_blend_view[ 0 ];
-	v_blend[ 1 ] = v_blend_view[ 1 ];
-	v_blend[ 2 ] = v_blend_view[ 2 ];
-	v_blend[ 3 ] = v_blend_view[ 3 ];
 
 }
 

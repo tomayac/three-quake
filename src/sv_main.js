@@ -54,20 +54,20 @@ import {
 import { hostname } from './net_main.js';
 import {
 	NET_CheckNewConnections, NET_SendMessage, NET_SendUnreliableMessage,
-	NET_CanSendMessage, NET_SendToAll, NET_Close, NET_GetMessage
+	NET_CanSendMessage, NET_CanSendUnreliableMessage, NET_SendToAll, NET_Close, NET_GetMessage
 } from './net_main.js';
 import { net_activeconnections, set_net_activeconnections } from './net.js';
-import { realtime, Host_ClearMemory, set_host_frametime } from './host.js';
+import { realtime, Host_ClearMemory, Host_Error, set_host_frametime } from './host.js';
 import { COM_LoadFile } from './pak.js';
 import { VectorCopy, VectorAdd, DotProduct } from './mathlib.js';
 import { Mod_ForName, Mod_LeafPVS } from './gl_model.js';
-import { PR_LoadProgs, PR_AllocEdicts, ED_ClearEdict, ED_LoadFromFile, PR_SetCurrentSkill } from './pr_edict.js';
-import { pr_global_struct, pr_strings, pr_edict_size, progs, pr_crc, EDICT_NUM, PR_SetSV, EDICT_TO_PROG, PROG_TO_EDICT, NEXT_EDICT, PR_GetString } from './progs.js';
+import { PR_LoadProgs, PR_AllocEdicts, ED_ClearEdict, ED_LoadFromFile, ED_NewString, GetEdictFieldValue, PR_SetCurrentSkill, PR_SetDeathmatch } from './pr_edict.js';
+import { pr_global_struct, pr_strings, pr_edict_size, progs, pr_crc, EDICT_NUM, NUM_FOR_EDICT, PR_SetSV, PR_SetSVS, EDICT_TO_PROG, PROG_TO_EDICT, NEXT_EDICT, PR_GetString } from './progs.js';
 import { SV_ClearWorld, SV_Move, SV_TestEntityPosition, SV_LinkEdict, SV_PointContents } from './world.js';
 import { SV_Physics, SV_SetState, SV_SetCallbacks,
 	sv_maxvelocity, sv_gravity, sv_nostep, sv_friction, sv_edgefriction,
 	sv_stopspeed, sv_maxspeed, sv_accelerate, sv_idealpitchscale } from './sv_phys.js';
-import { PR_ExecuteProgram } from './pr_exec.js';
+import { PR_ExecuteProgram, PR_SetHostError } from './pr_exec.js';
 import { SV_User_SetCallbacks, SV_SetIdealPitch } from './sv_user.js';
 import { V_CalcRoll } from './view.js';
 import { key_dest } from './keys.js';
@@ -100,6 +100,7 @@ SV_Init
 */
 export function SV_Init() {
 
+	PR_SetHostError( Host_Error );
 	Cvar_RegisterVariable( sv_maxvelocity );
 	Cvar_RegisterVariable( sv_gravity );
 	Cvar_RegisterVariable( sv_friction );
@@ -110,6 +111,7 @@ export function SV_Init() {
 	Cvar_RegisterVariable( sv_idealpitchscale );
 	Cvar_RegisterVariable( sv_aim );
 	Cvar_RegisterVariable( sv_nostep );
+	PR_SetDeathmatch( deathmatch );
 
 	for ( let i = 0; i < MAX_MODELS; i ++ )
 		localmodels[ i ] = '*' + i;
@@ -211,7 +213,7 @@ export function SV_StartSound( entity, channel, sample, volume, attenuation ) {
 	}
 
 	// NUM_FOR_EDICT -- entity index in edicts array
-	const ent = entity._index !== undefined ? entity._index : 0;
+	const ent = NUM_FOR_EDICT( entity );
 
 	channel = ( ent << 3 ) | channel;
 
@@ -912,8 +914,22 @@ export function SV_WriteClientdataToMessage( ent, msg ) {
 	if ( ent.v.idealpitch !== 0 )
 		bits |= SU_IDEALPITCH;
 
-	// stuff the sigil bits into the high bits of items for sbar
-	const items = ( ent.v.items | 0 ) | ( ( ( pr_global_struct ? pr_global_struct.serverflags : 0 ) | 0 ) << 28 );
+	// stuff the sigil bits into the high bits of items for sbar, or else
+	// mix in the optional mission-pack items2 field
+	const items2 = GetEdictFieldValue( ent, 'items2' );
+	let items;
+	if ( items2 !== null ) {
+
+		const value = items2.accessor.getFloat( items2.ofs ) | 0;
+		items = ( ent.v.items | 0 ) | ( value << 23 );
+
+	} else {
+
+		const serverflags =
+			( pr_global_struct !== null ? pr_global_struct.serverflags : 0 ) | 0;
+		items = ( ent.v.items | 0 ) | ( serverflags << 28 );
+
+	}
 
 	bits |= SU_ITEMS;
 
@@ -1239,6 +1255,11 @@ const _sendReconnectMsg = { allowoverflow: false, overflowed: false, data: _send
 
 function SV_SendClientDatagram( client ) {
 
+	// QW-style send gating: if transport is choked/backed up, skip building
+	// expensive per-frame datagrams and try again next frame.
+	if ( ! NET_CanSendUnreliableMessage( client.netconnection ) )
+		return true;
+
 	_scdMsg.allowoverflow = false;
 	_scdMsg.overflowed = false;
 	_scdMsg.cursize = 0;
@@ -1532,9 +1553,7 @@ function SV_CreateBaseline() {
 			} else {
 
 				svent.baseline.colormap = 0;
-				svent.baseline.modelindex = SV_ModelIndex(
-					typeof svent.v.model === 'string' ? svent.v.model : ''
-				);
+				svent.baseline.modelindex = SV_ModelIndex( PR_GetString( svent.v.model ) );
 
 			}
 
@@ -1611,8 +1630,9 @@ export function SV_SpawnServer( server ) {
 	// clear the server struct
 	Object.assign( sv, new ( sv.constructor )() );
 
-	// Ensure progs.js has a reference to the canonical sv object
+	// Ensure progs.js has references to the canonical server objects
 	PR_SetSV( sv );
+	PR_SetSVS( svs );
 
 	sv.name = server;
 	sv.modelname = 'maps/' + server + '.bsp';
@@ -1634,6 +1654,7 @@ export function SV_SpawnServer( server ) {
 		EDICT_TO_PROG,
 		PROG_TO_EDICT,
 		NEXT_EDICT,
+		GetEdictFieldValue,
 	} );
 
 	// allocate server memory
@@ -1710,7 +1731,7 @@ export function SV_SpawnServer( server ) {
 
 	if ( ent.v ) {
 
-		ent.v.model = sv.worldmodel.name || '';
+		ent.v.model = ED_NewString( sv.worldmodel.name );
 		ent.v.modelindex = 1; // world model
 		ent.v.solid = SOLID_BSP;
 		ent.v.movetype = MOVETYPE_PUSH;
@@ -1720,7 +1741,7 @@ export function SV_SpawnServer( server ) {
 		else
 			pr_global_struct.deathmatch = deathmatch.value;
 
-		pr_global_struct.mapname = sv.name;
+		pr_global_struct.mapname = ED_NewString( sv.name );
 
 	}
 
